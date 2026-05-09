@@ -1,0 +1,94 @@
+#include <SPI.h>
+#include <mcp2515.h>
+
+// MCP2515 CS-pin
+#define CAN_CS 10
+struct can_frame canMsg;
+struct MCP2515 mcp2515(CAN_CS);
+
+// Maks antall forsøk for sending
+#define MAX_RETRIES 3
+#define CAN_ACK_ID 0x037            // CAN ID for acknowledgment
+
+void setup() {
+  Serial.begin(115200);
+  SPI.begin();
+
+  // Init MCP2515
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_250KBPS, MCP_16MHZ);
+  
+  mcp2515.setNormalMode();
+
+  Serial.println("CAN Transmitter Ready");
+}
+
+void sendTwoFloats(uint32_t id, float a, float b) {
+  canMsg.can_id  = id;
+  canMsg.can_dlc = 8;              // 2 x float32 = 8 bytes
+
+  memcpy(&canMsg.data[0], &a, sizeof(float));
+  memcpy(&canMsg.data[4], &b, sizeof(float));
+
+  bool messageSent = false;
+  int retries = 0;
+
+  while (!messageSent && retries < MAX_RETRIES) {
+    if (mcp2515.sendMessage(&canMsg) == MCP2515::ERROR_OK) {
+      Serial.print("Message sent ID 0x");
+      Serial.print(id, HEX);
+      Serial.print(" [");
+      for (int i = 0; i < 8; i++) {
+        Serial.print(canMsg.data[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println("]");
+
+      // wait for ACK
+      unsigned long startTime = millis();
+      bool ackReceived = false;
+
+      while (millis() - startTime < 500) {
+        if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK) {
+          if (canMsg.can_id == CAN_ACK_ID) {
+            ackReceived = true;
+            break;
+          }
+        }
+      }
+
+      if (ackReceived) {
+        Serial.println("ACK received");
+        messageSent = true;
+      } else {
+        Serial.println("ACK not received, retrying...");
+        retries++;
+      }
+
+    } else {
+      Serial.println("Error sending message, retrying...");
+      retries++;
+    }
+  }
+
+  if (!messageSent) {
+    Serial.print("Failed to send ID 0x");
+    Serial.print(id, HEX);
+    Serial.println(" after retries");
+  }
+}
+
+void loop() {
+  static float x = 0.0f;
+  static float y = 100.0f;
+
+  // three example IDs – replace later with real car IDs
+  sendTwoFloats(0x35, x,        y);
+  sendTwoFloats(0x36, x * 2.0f, y * 0.5f);
+  sendTwoFloats(0x32, x - 10.0f, y + 5.0f);
+
+  x += 0.1f;
+  y -= 0.2f;
+
+  delay(200);
+}

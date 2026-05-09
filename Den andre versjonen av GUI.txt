@@ -1,0 +1,401 @@
+import sys
+import re
+import time
+import threading
+from collections import deque
+
+import serial
+from PyQt5 import QtWidgets, QtCore, QtGui
+import pyqtgraph as pg
+
+PORT    = "COM5"
+BAUD    = 115200
+MAX_PTS = 200
+
+# ── CAN-konfigurasjon ─────────────────────────────────────────────
+# "soc"    → egen slider-widget istedenfor plot
+# "dual"   → dobbel y-akse (RPM + Torque)
+# "normal" → standard to-kurve plot
+CAN_CFG = {
+    "100": {
+        "title": "Motor — RPM & Torque",
+        "type":  "dual",
+        "lbl1":  "RPM",       "unit1": "RPM",  "col1": (100, 220, 255),
+        "lbl2":  "Torque",    "unit2": "Nm",   "col2": (255, 180,  50),
+        "range1": (0, 6500),
+        "range2": (0, 420),
+    },
+    "101": {
+        "title": "Temperatures — Motor & Brake",
+        "type":  "normal",
+        "lbl1":  "Motor",     "unit1": "°C",   "col1": (255, 100,  80),
+        "lbl2":  "Brake",     "unit2": "°C",   "col2": (255, 200,  50),
+        "warn2": 200.0,
+    },
+    "200": {
+        "title": "Brake Pressure",
+        "type":  "normal",
+        "lbl1":  "Front",     "unit1": "bar",  "col1": (255, 120,  60),
+        "lbl2":  "Rear",      "unit2": "bar",  "col2": (255, 220,  60),
+    },
+    "201": {
+        "title": "Inverter — Current & Voltage",
+        "type":  "normal",
+        "lbl1":  "Current",   "unit1": "A",    "col1": (160, 255, 120),
+        "lbl2":  "Voltage",   "unit2": "V",    "col2": (200, 150, 255),
+    },
+    "300": {
+        "title": "State of Charge",
+        "type":  "soc",
+    },
+    "301": {
+        "title": "Cooling — Coolant & Pump",
+        "type":  "normal",
+        "lbl1":  "Coolant",   "unit1": "°C",   "col1": ( 50, 180, 255),
+        "lbl2":  "Pump",      "unit2": "A",    "col2": (100, 255, 200),
+    },
+}
+
+LINE_RE = re.compile(
+    r"(?:\[.*?\])?\s*ID=0x([0-9A-Fa-f]+),DLC=\d+,DATA=[0-9A-Fa-f ]+,"
+    r"f1=([-\d.]+),f2=([-\d.]+)"
+)
+
+
+# ── SOC Widget ────────────────────────────────────────────────────
+class SOCWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.soc = 95.0
+        self.setMinimumHeight(120)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(6)
+
+        # Tittel
+        title = QtWidgets.QLabel("0x300 — State of Charge")
+        title.setStyleSheet(
+            "color:#a0b8d0; font-weight:bold; font-size:11px;"
+        )
+        layout.addWidget(title)
+
+        # Stor prosenttekst
+        self.pctLabel = QtWidgets.QLabel("95.0 %")
+        self.pctLabel.setAlignment(QtCore.Qt.AlignCenter)
+        self.pctLabel.setStyleSheet(
+            "color:#50dc78; font-size:32px; font-weight:bold;"
+            "font-family:monospace;"
+        )
+        layout.addWidget(self.pctLabel)
+
+        # Slider (kun visuell — ikke interaktiv)
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(950)
+        self.bar.setFixedHeight(28)
+        self.bar.setTextVisible(False)
+        self.bar.setStyleSheet("""
+            QProgressBar {
+                background: #1a2030;
+                border: 1px solid #2a3545;
+                border-radius: 4px;
+            }
+            QProgressBar::chunk {
+                border-radius: 4px;
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0.0  #ff3030,
+                    stop:0.2  #ffaa00,
+                    stop:0.5  #ffdd00,
+                    stop:1.0  #30dd60
+                );
+            }
+        """)
+        layout.addWidget(self.bar)
+
+        # Min/Max labels
+        minmax = QtWidgets.QHBoxLayout()
+        l0 = QtWidgets.QLabel("0%")
+        l0.setStyleSheet("color:#405060; font-size:10px;")
+        l100 = QtWidgets.QLabel("100%")
+        l100.setStyleSheet("color:#405060; font-size:10px;")
+        l100.setAlignment(QtCore.Qt.AlignRight)
+        minmax.addWidget(l0)
+        minmax.addStretch()
+        minmax.addWidget(l100)
+        layout.addLayout(minmax)
+
+    def update_soc(self, soc: float):
+        self.soc = max(0.0, min(100.0, soc))
+        self.bar.setValue(int(self.soc * 10))
+        self.pctLabel.setText(f"{self.soc:.1f} %")
+
+        # Farge avhengig av SOC
+        if self.soc > 50:
+            color = "#30dd60"
+        elif self.soc > 20:
+            color = "#ffaa00"
+        else:
+            color = "#ff4040"
+        self.pctLabel.setStyleSheet(
+            f"color:{color}; font-size:32px; font-weight:bold;"
+            f"font-family:monospace;"
+        )
+
+
+# ── Plot-panel ────────────────────────────────────────────────────
+class PlotPanel(QtWidgets.QWidget):
+    def __init__(self, id_str, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg   = cfg
+        self.ptype = cfg["type"]
+        self.t     = deque(maxlen=MAX_PTS)
+        self.f1    = deque(maxlen=MAX_PTS)
+        self.f2    = deque(maxlen=MAX_PTS)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
+        self.pw = pg.PlotWidget(
+            title=f"0x{id_str.upper()} — {cfg['title']}"
+        )
+        self.pw.setBackground("#0a0f18")
+        self.pw.showGrid(x=True, y=True, alpha=0.2)
+        self.pw.setMinimumHeight(200)
+
+        if self.ptype == "dual":
+            # Venstre akse: RPM
+            self.pw.setLabel("left",  cfg["lbl1"],
+                             units=cfg["unit1"], color=cfg["col1"])
+            self.pw.setYRange(*cfg["range1"])
+
+            # Høyre akse: Torque via ViewBox
+            self.vb2 = pg.ViewBox()
+            self.pw.scene().addItem(self.vb2)
+            self.pw.getAxis("right").linkToView(self.vb2)
+            self.pw.getAxis("right").setLabel(
+                cfg["lbl2"], units=cfg["unit2"],
+                color=cfg["col2"]
+            )
+            self.pw.showAxis("right")
+            self.vb2.setXLink(self.pw)
+            self.vb2.setYRange(*cfg["range2"])
+
+            self.c1 = self.pw.plot(
+                pen=pg.mkPen(cfg["col1"], width=2),
+                name=f"{cfg['lbl1']} ({cfg['unit1']})"
+            )
+            self.c2 = pg.PlotCurveItem(
+                pen=pg.mkPen(cfg["col2"], width=2,
+                             style=QtCore.Qt.DashLine),
+                name=f"{cfg['lbl2']} ({cfg['unit2']})"
+            )
+            self.vb2.addItem(self.c2)
+
+            # Synkroniser ViewBox ved resize
+            self.pw.getViewBox().sigResized.connect(self._sync_vb)
+
+        else:
+            leg = self.pw.addLegend(offset=(8, 8))
+            leg.setLabelTextColor((150, 170, 190))
+            self.c1 = self.pw.plot(
+                pen=pg.mkPen(cfg["col1"], width=2),
+                name=f"{cfg['lbl1']} ({cfg['unit1']})"
+            )
+            self.c2 = self.pw.plot(
+                pen=pg.mkPen(cfg["col2"], width=2,
+                             style=QtCore.Qt.DashLine),
+                name=f"{cfg['lbl2']} ({cfg['unit2']})"
+            )
+            # Varsellinje
+            if cfg.get("warn2"):
+                self.pw.addLine(
+                    y=cfg["warn2"],
+                    pen=pg.mkPen(cfg["col2"], width=1,
+                                 style=QtCore.Qt.DotLine)
+                )
+            self.vb2 = None
+
+        layout.addWidget(self.pw)
+
+        # Live-label
+        self.liveLabel = QtWidgets.QLabel("● venter...")
+        self.liveLabel.setStyleSheet(
+            "color:#405060; font-family:monospace; font-size:10px;"
+            "padding:1px 4px;"
+        )
+        layout.addWidget(self.liveLabel)
+
+    def _sync_vb(self):
+        if self.vb2:
+            self.vb2.setGeometry(self.pw.getViewBox().sceneBoundingRect())
+
+    def push(self, t_val, f1_val, f2_val):
+        self.t.append(t_val)
+        self.f1.append(f1_val)
+        self.f2.append(f2_val)
+        ta = list(self.t)
+        self.c1.setData(ta, list(self.f1))
+        self.c2.setData(ta, list(self.f2))
+        lbl1 = self.cfg.get("lbl1", "f1")
+        lbl2 = self.cfg.get("lbl2", "f2")
+        u1   = self.cfg.get("unit1", "")
+        u2   = self.cfg.get("unit2", "")
+        self.liveLabel.setText(
+            f"  {lbl1}: {f1_val:.1f} {u1}   {lbl2}: {f2_val:.1f} {u2}"
+        )
+        self.liveLabel.setStyleSheet(
+            "color:#50dc78; font-family:monospace;"
+            "font-size:10px; padding:1px 4px;"
+        )
+
+
+# ── Hoved-vindu ───────────────────────────────────────────────────
+class CANMonitor(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("FS EV Telemetry")
+        self.startTime = time.time()
+        self.panels    = {}
+        self.soc_widget = None
+        self.lock      = threading.Lock()
+        self.queue     = deque(maxlen=500)
+        self.ser       = None
+
+        self._build_ui()
+
+        # Serial i egen tråd
+        t = threading.Thread(target=self._serial_worker, daemon=True)
+        t.start()
+
+        # GUI-oppdatering
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self._process_queue)
+        self.timer.start(50)   # 20 Hz
+
+    def _build_ui(self):
+        pg.setConfigOptions(antialias=False, useOpenGL=False)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setSpacing(4)
+        root.setContentsMargins(4, 4, 4, 4)
+
+        # Status
+        self.statusLbl = QtWidgets.QLabel(f"Kobler til {PORT}...")
+        self.statusLbl.setStyleSheet(
+            "color:#ffaa33; font-family:monospace; font-size:11px;"
+        )
+        root.addWidget(self.statusLbl)
+
+        # 2-kolonners grid
+        grid = QtWidgets.QGridLayout()
+        grid.setSpacing(6)
+
+        positions = [(0,0), (0,1), (1,0), (1,1), (2,0), (2,1)]
+        for (id_str, cfg), (row, col) in zip(CAN_CFG.items(), positions):
+            if cfg["type"] == "soc":
+                w = SOCWidget()
+                self.soc_widget = w
+            else:
+                w = PlotPanel(id_str, cfg)
+            w.setStyleSheet(
+                "background:#0e1520; border:1px solid #1e2d40;"
+                "border-radius:5px;"
+            )
+            grid.addWidget(w, row, col)
+            self.panels[id_str] = w
+
+        root.addLayout(grid)
+
+        # Log
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(200)
+        self.log.setFixedHeight(70)
+        self.log.setStyleSheet(
+            "background:#080c12; color:#405060;"
+            "font-family:monospace; font-size:10px; border:none;"
+        )
+        root.addWidget(self.log)
+
+    def _serial_worker(self):
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                self.ser = serial.Serial(PORT, BAUD, timeout=1)
+                QtCore.QMetaObject.invokeMethod(
+                    self.statusLbl, "setText",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, f"● {PORT}")
+                )
+                QtCore.QMetaObject.invokeMethod(
+                    self.statusLbl, "setStyleSheet",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, "color:#50dc78; font-family:monospace;")
+                )
+                break
+            except serial.SerialException:
+                time.sleep(1)
+
+        if not self.ser:
+            QtCore.QMetaObject.invokeMethod(
+                self.statusLbl, "setText",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(str, f"✗ {PORT} ikke funnet")
+            )
+            return
+
+        while True:
+            try:
+                raw = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                if raw:
+                    with self.lock:
+                        self.queue.append(raw)
+            except Exception:
+                break
+
+    def _process_queue(self):
+        with self.lock:
+            lines = list(self.queue)
+            self.queue.clear()
+
+        for raw in lines:
+            self.log.appendPlainText(raw)
+            m = LINE_RE.match(raw)
+            if not m:
+                continue
+            id_str = m.group(1).lower()
+            f1     = float(m.group(2))
+            f2     = float(m.group(3))
+            t_now  = time.time() - self.startTime
+
+            if id_str == "300" and self.soc_widget:
+                self.soc_widget.update_soc(f1)
+            elif id_str in self.panels:
+                self.panels[id_str].push(t_now, f1, f2)
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    pal = app.palette()
+    C, P = QtGui.QColor, QtGui.QPalette
+    pal.setColor(P.Window,        C(10,  14,  20))
+    pal.setColor(P.WindowText,    C(190, 205, 220))
+    pal.setColor(P.Base,          C(14,  20,  30))
+    pal.setColor(P.Text,          C(190, 205, 220))
+    pal.setColor(P.Button,        C(28,  36,  48))
+    pal.setColor(P.ButtonText,    C(190, 205, 220))
+    app.setPalette(pal)
+
+    win = CANMonitor()
+    win.resize(1300, 900)
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

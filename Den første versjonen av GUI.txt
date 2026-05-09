@@ -1,0 +1,149 @@
+import sys
+import serial
+import time
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+from collections import defaultdict
+
+PORT = "COM5"
+BAUD = 115200
+
+
+class CANMonitor(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+
+        # Serial connection
+        self.ser = serial.Serial(PORT, BAUD, timeout=1)
+
+        # File logging
+        self.logfile = open("telemetry_log.txt", "a", buffering=1)  # line-buffered
+        self.logfile.write("\n--- NEW SESSION ---\n")
+
+        # Data storage
+        self.data = defaultdict(lambda: {"t": [], "f1": [], "f2": []})
+
+        # MAIN LAYOUT
+        mainLayout = QtWidgets.QVBoxLayout(self)
+
+        # Filter box
+        self.filterBox = QtWidgets.QLineEdit()
+        self.filterBox.setPlaceholderText("Filter CAN IDs (e.g. 40,45,50)")
+        mainLayout.addWidget(self.filterBox)
+
+        # ⭐ SPLITTER (plots over, log under)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        mainLayout.addWidget(splitter)
+
+        # --- TOP: Plot area ---
+        self.plotWidget = pg.GraphicsLayoutWidget()
+        splitter.addWidget(self.plotWidget)
+
+        # --- BOTTOM: Log window ---
+        self.logWindow = QtWidgets.QPlainTextEdit()
+        self.logWindow.setReadOnly(True)
+        self.logWindow.setMaximumBlockCount(5000)
+        self.logWindow.setMinimumHeight(250)
+        self.logWindow.setStyleSheet("border: 2px solid #444;")
+        splitter.addWidget(self.logWindow)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([600, 300])
+
+        # Plot storage
+        self.plots = {}
+
+        # Timer
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update)
+        self.timer.start(10)
+
+        self.startTime = time.time()
+
+    def parse_line(self, line):
+        try:
+            parts = line.split(",")
+
+            # ID=0x45 → "45"
+            id_hex = parts[0].split("=")[1].strip()
+            if id_hex.startswith("0x"):
+                id_hex = id_hex[2:]
+
+            f1 = float(parts[-2].split("=")[1].strip())
+            f2 = float(parts[-1].split("=")[1].strip())
+
+            return id_hex, f1, f2
+
+        except Exception as e:
+            print("Parse error:", e, "LINE:", line)
+            return None
+
+    def update(self):
+        line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+
+        if line:
+            # Show in GUI
+            self.logWindow.appendPlainText(f"RAW: {line}")
+
+            # Save to file
+            self.logfile.write(line + "\n")
+
+        if not line:
+            return
+
+        parsed = self.parse_line(line)
+        if not parsed:
+            return
+
+        id_str, f1, f2 = parsed
+
+        # Log parsed message
+        self.logWindow.appendPlainText(f"ID {id_str}: {f1:.3f}, {f2:.3f}")
+
+        # Filter for plotting
+        filter_text = self.filterBox.text().strip()
+        if filter_text:
+            allowed = [x.strip() for x in filter_text.split(",")]
+            if id_str not in allowed:
+                return
+
+        # Store data
+        t = time.time() - self.startTime
+        self.data[id_str]["t"].append(t)
+        self.data[id_str]["f1"].append(f1)
+        self.data[id_str]["f2"].append(f2)
+
+        # Create plot if needed
+        if id_str not in self.plots:
+            p = self.plotWidget.addPlot(title=f"CAN ID {id_str}")
+            p.showGrid(x=True, y=True)
+            curve1 = p.plot(pen=pg.mkPen("y", width=2))
+            curve2 = p.plot(pen=pg.mkPen("c", width=2))
+            self.plots[id_str] = (p, curve1, curve2)
+            self.plotWidget.nextRow()
+
+        p, curve1, curve2 = self.plots[id_str]
+        curve1.setData(self.data[id_str]["t"], self.data[id_str]["f1"])
+        curve2.setData(self.data[id_str]["t"], self.data[id_str]["f2"])
+
+    def closeEvent(self, event):
+        try:
+            self.logfile.write("--- SESSION END ---\n")
+            self.logfile.close()
+        except:
+            pass
+        event.accept()
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    win = CANMonitor()
+    win.setWindowTitle("Real-Time CAN Telemetry Monitor")
+    win.resize(1000, 900)
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

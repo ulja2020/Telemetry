@@ -1,0 +1,181 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <RadioLib.h>
+#include <mcp2515.h>   // bare for can_frame struct
+
+// === PINS ===
+#define RADIO_MOSI2_PIN 11     
+#define RADIO_SCLK2_PIN 12
+#define RADIO_MISO2_PIN 13 
+
+#define SX1280_CS      10
+#define SX1280_DIO     47
+#define SX1280_BUSY    48
+#define SX1280_NRESET  38
+
+//control vars
+bool sdCardInserted = false;
+bool sdCardInitiated = false;
+bool fileInitiated = false;
+String RXstr;
+int state;
+int numBytes;
+
+long unsigned int rxId;
+unsigned char len = 0;
+unsigned char rxBuf[8];
+char msgString[128]; 
+
+
+// === OBJECTS ===
+SX1280 radio = new Module(SX1280_CS, SX1280_DIO, SX1280_NRESET, SX1280_BUSY);
+// flag to indicate that a packet was received
+volatile bool receivedFlag = false;
+struct can_frame canMsg;
+
+void setFlag(void) {
+  // we got a packet, set the flag
+  receivedFlag = true;
+}
+
+//void byteArrayToStruct(const uint8_t *byteArray, can_frame &frame);
+//void structToByteArray(const can_frame &frame, uint8_t *byteArray);
+void setRadioSettings(SX1280 &radio, int &state);
+void PrintFrame(can_frame frame, bool HumanReadAble = false);
+
+void PrintFrame(can_frame frame, bool HumanReadAble){
+  if (HumanReadAble){
+    Serial.println("------- CAN Read ----------");
+    Serial.println("ID\tDLC\tDATA");
+    Serial.print(frame.can_id, HEX); // print ID
+    Serial.print("\t"); 
+    Serial.print(frame.can_dlc, HEX); // print DLC
+    Serial.print("\t");
+    for (int i = 0; i < frame.can_dlc; i++)  {  // print the data
+      Serial.print(frame.data[i],HEX);
+      Serial.print(" ");
+    }
+  } else  {
+    Serial.print(frame.can_id, HEX); // print ID
+    Serial.print(","); 
+    Serial.print(frame.can_dlc, HEX); // print DLC
+    Serial.print(",");
+    for (int i = 0; i < frame.can_dlc; i++)  {  // print the data
+      Serial.print(frame.data[i],HEX);
+      Serial.print(" ");
+    }
+  }
+  Serial.println();
+}
+
+void PrintFloatFrame(const can_frame &frame) {
+  // Print ID and DLC
+  Serial.print("ID=0x");
+  Serial.print(frame.can_id, HEX);
+  Serial.print(", DLC=");
+  Serial.print(frame.can_dlc);
+  Serial.print(", DATA=");
+
+  // Print raw bytes
+  for (int i = 0; i < frame.can_dlc; i++) {
+    if (frame.data[i] < 16) Serial.print("0");
+    Serial.print(frame.data[i], HEX);
+    Serial.print(i == frame.can_dlc - 1 ? "" : " ");
+  }
+
+  // Decode only if DLC == 8
+  if (frame.can_dlc == 8) {
+    float f1, f2;
+    memcpy(&f1, &frame.data[0], 4);
+    memcpy(&f2, &frame.data[4], 4);
+
+    Serial.print(", f1=");
+    Serial.print(f1, 6);
+    Serial.print(", f2=");
+    Serial.print(f2, 6);
+  } else {
+    Serial.print(", <not 2 floats>");
+  }
+
+  Serial.println();
+}
+
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  SPI.begin(RADIO_SCLK2_PIN, RADIO_MISO2_PIN, RADIO_MOSI2_PIN);
+  pinMode(SX1280_BUSY, INPUT_PULLUP);
+
+  // When the power is turned on, a delay is required.
+  delay(1500);
+  state = radio.begin();
+  Serial.print(F("[SX1280] Initializing ... "));
+  
+
+  if (state == RADIOLIB_ERR_NONE) {
+      Serial.println(F("success!"));
+  } else {
+      Serial.print(F("failed, code "));
+      Serial.println(state);
+      while (true);
+  }
+
+  radio.setFrequency(2445.0);
+  radio.setBandwidth(203.125);
+  radio.setSpreadingFactor(7);
+  radio.setCodingRate(5);
+
+// set the function that will be called
+  radio.setPacketReceivedAction(setFlag);
+  Serial.print(F("[SX1280] Starting to listen ... "));
+  state = radio.startReceive();
+  if (state == RADIOLIB_ERR_NONE) {
+      Serial.println(F("success!"));
+  } else {
+      Serial.print(F("failed, code "));
+      Serial.println(state);
+      while (true);
+  }
+
+  radio.startReceive();
+
+}
+
+// ================= LOOP =================
+void loop() {
+  if (receivedFlag) {
+    receivedFlag = false;
+
+    numBytes = radio.getPacketLength();
+    if (numBytes != sizeof(canMsg)) {
+      // unexpected packet size, read and discard
+      uint8_t dumpBuf[64];
+      radio.readData(dumpBuf, numBytes);
+      radio.startReceive();
+      return;
+    }
+      // les RSSI kontinuerlig
+    float rssi = radio.getRSSI();
+
+    Serial.print("RSSI = ");
+    Serial.print(rssi);
+    Serial.println(" dBm");
+
+    delay(300);
+    
+    uint8_t byteArr[sizeof(canMsg)];
+    state = radio.readData(byteArr, sizeof(byteArr));
+
+    memcpy(&canMsg, byteArr, sizeof(canMsg));
+
+    // print as two floats per frame
+    PrintFloatFrame(canMsg);
+
+    radio.startReceive();    
+  }
+}
+
+  

@@ -1,0 +1,130 @@
+#ifndef PINS_DECL_H_
+#define PINS_DECL_H_
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <FS.h>
+#include <RadioLib.h>
+#include <mcp2515.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+#define SPI_SPEED 8000000U
+
+#define PIN_NUM_SCLK 40  //CAN
+#define PIN_NUM_MISO 41
+#define PIN_NUM_MOSI 42
+
+#define RADIO_MOSI2_PIN 11    //Lora 
+#define RADIO_SCLK2_PIN 12
+#define RADIO_MISO2_PIN 13 
+
+// SX1280
+#define SX1280_CS 10
+#define SX1280_DIO 47
+#define SX1280_BUSY 48
+#define SX1280_NRESET 38
+
+// CAN CONTROLLER
+#define CAN0_INT 2                          
+#define CAN_CS 39
+
+// MCP2515
+struct can_frame canFrame;
+
+// control vars
+int state;
+
+#endif /* PINS */
+
+// ================= SPI / CAN / LORA =================
+SPIClass spi1(HSPI);
+SX1280 radio = new Module(SX1280_CS, SX1280_DIO, SX1280_NRESET, SX1280_BUSY);
+MCP2515 mcp2515(CAN_CS, SPI_SPEED, &spi1);
+struct can_frame canMsg;
+
+// CAN IDs
+#define CAN_SENDER_ID 0x036
+#define CAN_ACK_ID    0x037
+
+volatile bool RX_FLAG = false;
+
+// ================= CAN INT =================
+void IRAM_ATTR canInterruptHandler() {
+  RX_FLAG = true;
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Init CAN Receiver (Custom Board)");
+
+  // SPI
+  spi1.begin(PIN_NUM_SCLK, PIN_NUM_MISO, PIN_NUM_MOSI);
+  
+  //Lora
+  SPI.begin(RADIO_SCLK2_PIN, RADIO_MISO2_PIN, RADIO_MOSI2_PIN);
+
+  // CAN
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_500KBPS,  MCP_8MHZ);    // works with PCAN View
+  //mcp2515.setBitrate(CAN_250KBPS);             // works with Arduino
+  mcp2515.setNormalMode();
+
+  pinMode(CAN0_INT, INPUT);
+
+  attachInterrupt(digitalPinToInterrupt(CAN0_INT), canInterruptHandler, FALLING);
+
+  // LoRa
+ if (radio.begin() != RADIOLIB_ERR_NONE) {
+    Serial.println("Radio init failed");
+    while (true);
+}                                                      
+  radio.setDio1Action(NULL);                             
+  pinMode(SX1280_BUSY, INPUT_PULLUP);
+
+  radio.setFrequency(2445.0);
+  radio.setBandwidth(203.125);
+  radio.setSpreadingFactor(7);
+  radio.setCodingRate(5);
+  radio.setOutputPower(13);
+
+
+  Serial.println("=== TX: CAN → LoRa ready ===");
+}
+
+
+// ================= LOOP =================
+void loop() {
+  if (RX_FLAG) {
+    RX_FLAG = false;
+
+    if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK) {
+
+      // print CAN frame
+      Serial.print("CAN ID 0x"); Serial.print(canMsg.can_id, HEX);
+      Serial.print(" DLC "); Serial.print(canMsg.can_dlc);
+      Serial.print(" Data: ");
+      for (int i = 0; i < canMsg.can_dlc; i++) {
+        Serial.print(canMsg.data[i], HEX); Serial.print(" ");
+      }
+      Serial.println();
+
+      // send entire can_frame over LoRa
+      int txState = radio.transmit((uint8_t*)&canMsg, sizeof(canMsg));
+      Serial.println("LoRa TX done");
+      if (txState != RADIOLIB_ERR_NONE) {
+        Serial.print("LoRa TX error: "); Serial.println(txState);
+      }
+
+      // send clean ACK frame
+      struct can_frame ack;
+      ack.can_id  = CAN_ACK_ID;
+      ack.can_dlc = 0;
+      mcp2515.sendMessage(&ack);
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# __init__: Åpne fil og skriv sesjonshode
+
+self.logfile = open("telemetry_log.txt", "a", buffering=1)  # line-buffered
+self.logfile.write("\n--- NEW SESSION ---\n")
+
+# update(): Skriv hver linje som mottas til fil
+
+if line:
+    self.logfile.write(line + "\n")
+
+# closeEvent: Avslutt sesjonen og lukk filen
+
+def closeEvent(self, event):
+    try:
+        self.logfile.write("--- SESSION END ---\n")
+        self.logfile.close()
+    except:
+        pass
+    event.accept()
